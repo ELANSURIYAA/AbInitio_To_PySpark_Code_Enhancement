@@ -1,0 +1,152 @@
+- Metadata Requirements:
+-=============================================
+- Author: AAVA
+- Date: 
+- Description: Migration of Mortgage Amendment event-to-MISMO XML ETL logic from Ab Initio to PySpark/Databricks.
+-=============================================
+
+# Technical Specification for Migrate "Mortgage Amendment to MISMO XML" Graph to PySpark
+
+## 1. Introduction
+
+* **Objective:**  
+  Migrate the legacy Ab Initio graph `G_MtgAmendment_To_MISMO_XML` to a PySpark-based ETL pipeline on Databricks. The pipeline must ingest raw mortgage amendment events, validate and transform them, and generate MISMO-compliant XML files, ensuring 1:1 functional parity with the legacy process.
+
+* **Scope:**  
+  - Develop a PySpark job to process daily mortgage amendment event files.
+  - Implement schema and business rule validation.
+  - Generate MISMO XML files via template-based token replacement.
+  - Persist raw, rejected, and output records for audit and lineage.
+
+## 2. Code Changes Required
+
+* **Impacted Modules:**
+  - New PySpark job: `G_MtgAmendment_To_MISMO_XML.py`
+  - UDFs for JSON parsing and business validation
+  - XML rendering logic (token replacement)
+  - Data I/O (read/write to landing, output, and error directories)
+  - Unit test scripts
+
+* **Logic Implementation (Pseudocode/Steps):**
+
+  1. **Configuration & Schema Setup**
+     - Define StructType schemas for all input, intermediate, and output datasets.
+     - Accept dynamic file paths for input/output via `sys.argv`.
+
+  2. **Ingest & Metadata Extraction**
+     - Read pipe-delimited landing files from `LANDING_DIR`.
+     - Use regex-based UDFs to extract scalar fields from JSON payloads.
+     - Persist the raw events DataFrame to `RAW_OUT`.
+
+  3. **Validation Logic**
+     - **Schema Validation:** Filter out records missing `event_id`, `loan_id`, or with incorrect `event_type`.
+     - **Business Validation:** Use a UDF to check for missing `effective_date` or `new_rate` (when `amendment_type == "RATE_CHANGE"`).
+     - Write all rejected records to `ERROR_LOG_PATH` with appropriate reject reasons.
+
+  4. **XML Generation**
+     - Load the single-row XML template from `mismo_template_record.dat`.
+     - Broadcast join template to valid events.
+     - Use a UDF to replace tokens (e.g., `{{LOAN_ID}}`) with actual values.
+     - Write XML output to `MISMO_OUT_PATH`.
+
+  5. **Unit Testing**
+     - Implement tests for valid, schema-rejected, and business-rejected scenarios.
+
+## 3. Data Model Updates
+
+* **New/Modified Objects:**
+
+  | Table/Object Name         | Description                                  |
+  |--------------------------|----------------------------------------------|
+  | kafka_event              | Raw ingested event records                   |
+  | event_meta               | Parsed/flattened event metadata              |
+  | template_record          | XML template (single row, for join)          |
+  | reject_record            | Records failing schema/business validation    |
+  | xml_out_record           | Final XML output records                     |
+
+* **Schema Definition:**
+
+  ### kafka_event (Input)
+  | Column Name   | Type    | Comment                                   |
+  |---------------|---------|-------------------------------------------|
+  | event_id      | STRING  | Unique event identifier                   |
+  | loan_id       | STRING  | Loan identifier                           |
+  | event_type    | STRING  | Should be 'MORTGAGE_AMENDMENT'            |
+  | payload       | STRING  | Raw JSON payload                          |
+  | ingest_ts     | TIMESTAMP | Ingestion timestamp                    |
+
+  ### event_meta (Intermediate)
+  | Column Name      | Type    | Comment                                 |
+  |------------------|---------|-----------------------------------------|
+  | event_id         | STRING  | Propagated from kafka_event             |
+  | loan_id          | STRING  | Propagated from kafka_event             |
+  | amendment_type   | STRING  | Parsed from payload                     |
+  | effective_date   | DATE    | Parsed from payload                     |
+  | new_rate         | DOUBLE  | Parsed from payload                     |
+  | ...              | ...     | Other fields as per payload             |
+
+  ### template_record (Lookup)
+  | Column Name      | Type    | Comment                                 |
+  |------------------|---------|-----------------------------------------|
+  | template_text    | STRING  | XML template with tokens                |
+
+  ### reject_record (Output)
+  | Column Name      | Type    | Comment                                 |
+  |------------------|---------|-----------------------------------------|
+  | event_id         | STRING  | Event identifier                        |
+  | loan_id          | STRING  | Loan identifier                         |
+  | reject_type      | STRING  | 'SCHEMA' or 'BUSINESS'                  |
+  | reject_reason    | STRING  | Description of rejection                |
+  | raw_payload      | STRING  | Original event payload                  |
+  | reject_ts        | TIMESTAMP | Rejection timestamp                   |
+
+  ### xml_out_record (Output)
+  | Column Name      | Type    | Comment                                 |
+  |------------------|---------|-----------------------------------------|
+  | event_id         | STRING  | Event identifier                        |
+  | loan_id          | STRING  | Loan identifier                         |
+  | xml_text         | STRING  | Generated MISMO XML                     |
+  | output_ts        | TIMESTAMP | Output timestamp                      |
+
+## 4. Source-to-Target Mapping
+
+| Source Field (kafka_event/payload) | Target Field (xml_out_record) | Transformation Rule                                      |
+|------------------------------------|-------------------------------|----------------------------------------------------------|
+| event_id                           | event_id                      | Direct mapping                                           |
+| loan_id                            | loan_id                       | Direct mapping                                           |
+| payload.new_rate                   | xml_text (token)              | Replace `{{NEW_RATE}}` in template with value            |
+| payload.effective_date             | xml_text (token)              | Replace `{{EFFECTIVE_DATE}}` in template with value      |
+| payload.amendment_type             | xml_text (token)              | Replace `{{AMENDMENT_TYPE}}` in template with value      |
+| ...                                | ...                           | ... (repeat for all required tokens in template)         |
+
+## 5. Assumptions and Constraints
+
+* The payload JSON structure is consistent and contains all required fields for token replacement.
+* All template tokens in `mismo_template_record.dat` have corresponding fields in the event payload.
+* Only flat token replacement is required; no hierarchical XML generation.
+* Data types are inferred based on standard mortgage event conventions (e.g., `new_rate` as DOUBLE, `effective_date` as DATE).
+* The template file contains a single row and is small enough for broadcast join.
+* Input files are pipe-delimited and contain a JSON payload column.
+* The job is batch-oriented; real-time streaming is out of scope.
+* Error and output paths are provided at runtime and are accessible by the Spark job.
+
+## 6. References
+
+* JIRA ID: PCE-4
+
+---
+
+### Cost Estimation
+
+| Task                                  | Estimated Effort (Person-Days) |
+|----------------------------------------|-------------------------------|
+| Schema & Configuration Setup           | 1                             |
+| Ingestion & Metadata Extraction        | 1                             |
+| Validation Logic Implementation        | 1.5                           |
+| XML Generation & Template Join         | 1                             |
+| Output & Error Handling                | 0.5                           |
+| Unit Testing & Debugging               | 1                             |
+| Documentation & Handover               | 0.5                           |
+| **Total**                              | **6.5 Person-Days**           |
+
+---
